@@ -2,8 +2,9 @@
 """
 YouTube Comment Watcher — Telegram-бот.
 
-Вы присылаете боту ссылку на видео -> бот следит за новыми комментариями под ним
-и присылает уведомления. Кнопкой можно временно выключить уведомления.
+Вы присылаете боту ссылку на видео -> бот следит за новыми комментариями
+и ответами на комментарии под ним и присылает уведомления.
+Кнопкой можно временно выключить уведомления.
 
 Только чтение через официальный YouTube Data API: бот ничего не пишет, не лайкает
 и не смотрит видео, поэтому никакой накрутки нет.
@@ -12,13 +13,14 @@ YouTube Comment Watcher — Telegram-бот.
 
 Переменные окружения (или файл .env рядом со скриптом):
   YT_API_KEY      ключ YouTube Data API v3                      (обязательно)
-  TG_BOT_TOKEN    токен бота от @BotFather                       (обязательно)
+  TG_BOT_TOKEN    токен бота от @BotFather                       (обязательно;
+                  на Bothost подставляется сам как BOT_TOKEN)
   TG_CHAT_ID      ваш chat_id; если не задан, хозяином станет тот,
                   кто первым напишет боту /start
   POLL_SECONDS    минимальный интервал проверки, по умолчанию 20
   DAILY_BUDGET    сколько запросов к API тратить в сутки, по умолчанию 8000
                   (бесплатный лимит YouTube — 10 000)
-  STATE_FILE      файл состояния, по умолчанию state.json
+  STATE_FILE      файл состояния, по умолчанию /app/data/state.json или state.json
 """
 
 import html
@@ -54,7 +56,7 @@ load_dotenv(BASE_DIR / ".env")
 def env(name: str, default: str = None) -> str:
     value = os.environ.get(name, default)
     if value is None or value == "":
-        sys.exit(f"Не задана переменная окружения {name} (см. README.md)")
+        sys.exit(f"Не задана переменная окружения {name}")
     return value
 
 
@@ -76,7 +78,8 @@ def default_state_file() -> Path:
 
 
 STATE_FILE = Path(os.environ.get("STATE_FILE") or default_state_file())
-MAX_SEEN_PER_VIDEO = 2000
+MAX_SEEN_PER_VIDEO = 5000
+MAX_REPLY_PAGES = 5  # до 500 ответов в одной ветке
 
 BTN_PAUSE = "🔕 Выключить уведомления"
 BTN_RESUME = "🔔 Включить уведомления"
@@ -85,6 +88,10 @@ BTN_LIST = "📋 Мои видео"
 
 def log(msg: str) -> None:
     print(time.strftime("%Y-%m-%d %H:%M:%S"), msg, flush=True)
+
+
+def utc_now_iso() -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
 
 # ---------------------------------------------------------------- state
@@ -103,7 +110,8 @@ def load_state() -> dict:
 
 state = load_state()
 state.setdefault("paused", False)
-state.setdefault("videos", {})  # video_id -> {"title": str, "seen": [comment_id, ...]}
+# video_id -> {"title", "seen": [id...], "reply_counts": {thread_id: n}, "added_at": iso}
+state.setdefault("videos", {})
 state.setdefault("owner", TG_CHAT_ID or None)
 state.setdefault("tg_offset", 0)
 if TG_CHAT_ID:
@@ -112,6 +120,7 @@ if TG_CHAT_ID:
 
 def save_state() -> None:
     with lock:
+        STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
         tmp = STATE_FILE.with_suffix(".tmp")
         tmp.write_text(json.dumps(state, ensure_ascii=False), encoding="utf-8")
         tmp.replace(STATE_FILE)
@@ -168,8 +177,20 @@ def fetch_video_title(video_id: str):
     return items[0]["snippet"]["title"] if items else None
 
 
-def fetch_latest_comments(video_id: str) -> list:
-    """100 последних комментариев верхнего уровня под видео (1 единица квоты)."""
+def _comment(c: dict) -> dict:
+    s = c["snippet"]
+    return {
+        "id": c["id"],
+        "author": s.get("authorDisplayName", "?"),
+        "author_url": s.get("authorChannelUrl", ""),
+        "text": s.get("textDisplay", ""),
+        "published": s.get("publishedAt", ""),
+    }
+
+
+def fetch_latest_threads(video_id: str) -> list:
+    """100 последних веток комментариев под видео (1 единица квоты).
+    Каждая ветка: комментарий верхнего уровня + сколько под ним ответов."""
     data = yt(
         "commentThreads",
         part="snippet",
@@ -180,16 +201,25 @@ def fetch_latest_comments(video_id: str) -> list:
     )
     out = []
     for item in data.get("items", []):
-        top = item["snippet"]["topLevelComment"]
-        s = top["snippet"]
-        out.append(
-            {
-                "id": top["id"],
-                "author": s.get("authorDisplayName", "?"),
-                "author_url": s.get("authorChannelUrl", ""),
-                "text": s.get("textDisplay", ""),
-            }
-        )
+        c = _comment(item["snippet"]["topLevelComment"])
+        c["thread_id"] = item["id"]
+        c["reply_count"] = int(item["snippet"].get("totalReplyCount", 0))
+        out.append(c)
+    return out
+
+
+def fetch_replies(thread_id: str) -> list:
+    """Все ответы в ветке (1 единица квоты за каждые 100 ответов)."""
+    out, page = [], None
+    for _ in range(MAX_REPLY_PAGES):
+        params = dict(part="snippet", parentId=thread_id, maxResults=100, textFormat="plainText")
+        if page:
+            params["pageToken"] = page
+        data = yt("comments", **params)
+        out += [_comment(c) for c in data.get("items", [])]
+        page = data.get("nextPageToken")
+        if not page:
+            break
     return out
 
 
@@ -215,19 +245,31 @@ def send(text: str, chat_id=None, keyboard=None) -> None:
         log(f"Telegram sendMessage {e.code}: {e.read()[:300]!r}")
 
 
-def format_comment(video_id: str, title: str, c: dict) -> str:
+def shorten(text: str, limit: int) -> str:
+    text = " ".join(text.split())
+    return text if len(text) <= limit else text[: limit - 1] + "…"
+
+
+def format_comment(video_id: str, title: str, c: dict, parent: dict = None) -> str:
     e = html.escape
     link = f"https://www.youtube.com/watch?v={video_id}&lc={c['id']}"
     author = e(c["author"])
     if c["author_url"]:
         author = f'<a href="{e(c["author_url"])}">{author}</a>'
     text = c["text"] if len(c["text"]) <= 3000 else c["text"][:3000] + "…"
+    if parent:
+        header = (
+            f"↩️ <b>Новый ответ</b>\n"
+            f"🎬 {e(title)}\n"
+            f"💬 На комментарий {e(parent['author'])}: <i>«{e(shorten(parent['text'], 150))}»</i>\n"
+        )
+    else:
+        header = f"💬 <b>Новый комментарий</b>\n🎬 {e(title)}\n"
     return (
-        f"💬 <b>Новый комментарий</b>\n"
-        f"🎬 {e(title)}\n"
+        f"{header}"
         f"👤 {author}\n\n"
         f"{e(text)}\n\n"
-        f'<a href="{link}">Открыть комментарий</a>'
+        f'<a href="{link}">Открыть {"ответ" if parent else "комментарий"}</a>'
     )
 
 
@@ -241,7 +283,7 @@ def add_video(video_id: str) -> None:
         if not title:
             send("Видео не найдено. Проверь ссылку (приватные видео отслеживать нельзя).")
             return
-        existing = fetch_latest_comments(video_id)
+        threads = fetch_latest_threads(video_id)
     except urllib.error.HTTPError as e:
         reason = http_error_reason(e)
         if reason == "commentsDisabled":
@@ -250,12 +292,17 @@ def add_video(video_id: str) -> None:
             send(f"YouTube вернул ошибку: {html.escape(reason)}")
         return
     with lock:
-        state["videos"][video_id] = {"title": title, "seen": [c["id"] for c in existing]}
+        state["videos"][video_id] = {
+            "title": title,
+            "seen": [t["id"] for t in threads],
+            "reply_counts": {t["thread_id"]: t["reply_count"] for t in threads},
+            "added_at": utc_now_iso(),
+        }
     save_state()
     log(f"Добавлено видео {video_id}: {title}")
     send(
         f"✅ Слежу за «{html.escape(title)}»\n"
-        f"Старые комментарии ({len(existing)}) пропускаю, пришлю только новые."
+        f"Старые комментарии ({len(threads)}) пропускаю, пришлю только новые комментарии и ответы."
         + interval_note()
     )
 
@@ -336,7 +383,8 @@ def handle_update(upd: dict) -> None:
         return
 
     if text.startswith("/start") or text.startswith("/help"):
-        send("Привет! Пришли ссылку на YouTube-видео — буду присылать новые комментарии под ним.\n"
+        send("Привет! Пришли ссылку на YouTube-видео — буду присылать новые комментарии "
+             "и ответы на комментарии под ним.\n"
              "Можно прислать несколько ссылок.\n\n"
              "Кнопки внизу: выключить/включить уведомления и список видео.")
     elif text == BTN_PAUSE or text == "/pause":
@@ -387,7 +435,7 @@ def current_interval() -> int:
 
 def check_video(video_id: str) -> None:
     try:
-        comments = fetch_latest_comments(video_id)
+        threads = fetch_latest_threads(video_id)
     except urllib.error.HTTPError as e:
         reason = http_error_reason(e)
         log(f"{video_id}: ошибка YouTube {reason}")
@@ -406,19 +454,51 @@ def check_video(video_id: str) -> None:
         v = state["videos"].get(video_id)
         if v is None:
             return
-        seen = set(v["seen"])
-        new = [c for c in reversed(comments) if c["id"] not in seen]  # от старых к новым
-        if not new:
-            return
-        v["seen"].extend(c["id"] for c in new)
-        v["seen"] = v["seen"][-MAX_SEEN_PER_VIDEO:]
-        paused = state["paused"]
         title = v["title"]
+        seen = set(v["seen"])
+        if "reply_counts" not in v:
+            # Видео добавлено старой версией бота: запоминаем текущие ответы, ничего не присылаем
+            v["reply_counts"] = {t["thread_id"]: t["reply_count"] for t in threads}
+            v["added_at"] = utc_now_iso()
+        counts = dict(v["reply_counts"])
+        added_at = v["added_at"]
+
+    events = []  # (comment, parent или None) в порядке от старых к новым
+    for t in reversed(threads):
+        is_new_thread = t["id"] not in seen
+        if is_new_thread:
+            events.append((t, None))
+        known = 0 if is_new_thread else counts.get(t["thread_id"], t["reply_count"])
+        if t["reply_count"] > known:
+            try:
+                replies = fetch_replies(t["thread_id"])
+            except urllib.error.HTTPError as e:
+                if http_error_reason(e) in ("quotaExceeded", "dailyLimitExceeded"):
+                    raise
+                log(f"{video_id}: не смог получить ответы ветки {t['thread_id']}")
+                continue
+            replies.sort(key=lambda r: r["published"])
+            for r in replies:
+                if r["id"] not in seen and r["published"] >= added_at:
+                    events.append((r, t))
+        counts[t["thread_id"]] = t["reply_count"]
+
+    with lock:
+        v = state["videos"].get(video_id)
+        if v is None:
+            return
+        v["reply_counts"] = counts
+        if events:
+            v["seen"].extend(c["id"] for c, _ in events)
+            v["seen"] = v["seen"][-MAX_SEEN_PER_VIDEO:]
+        paused = state["paused"]
     save_state()
-    for c in new:
-        log(f"{video_id}: новый комментарий от {c['author']}{' (пауза)' if paused else ''}")
+
+    for c, parent in events:
+        kind = "ответ" if parent else "комментарий"
+        log(f"{video_id}: новый {kind} от {c['author']}{' (пауза)' if paused else ''}")
         if not paused and state["owner"]:
-            send(format_comment(video_id, title, c))
+            send(format_comment(video_id, title, c, parent))
 
 
 def watch_loop() -> None:
